@@ -6,7 +6,7 @@
 --   https://www.gnu.org/licenses/gpl2.html
 --
 --   VDR Streamdev Client
---   Version 0.3.3
+--   Version 0.3.3.1
 --
 --   A script which turns mpv into a client for VDR with the Streamdev-Plugin
 --
@@ -1063,6 +1063,7 @@ local function parse_lstc(stdout)
                         cinfo['id']=cid
                     end
                     table.insert(channels,cinfo)
+                    cinfo.idx=#channels
                     chno_to_idx[cinfo.no]=#channels
                     if cinfo.id then
                         chid_to_idx[cinfo.id]=#channels

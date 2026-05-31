@@ -1,6 +1,6 @@
 --
 --   VDR Streamdev Client
---   Version 0.2.0
+--   Version 0.3.0
 --
 --   A script which turns mpv into a client for VDR with the Streamdev-Plugin
 --
@@ -30,6 +30,10 @@
 --   The key 'm' will show the menu.
 --
 --
+--   Many thanks to:
+--   - wolfi.m@vdr-portal.de for fixing the dimensions of the time-box
+--     in the channel-info
+--
 --   Copyright 2017 Martin Wache
 --   VDR Streamdev Client is free software; you can redistribute it and/or
 --   modify it under the terms of the GNU General Public License as published 
@@ -38,47 +42,157 @@
 --   https://www.gnu.org/licenses/gpl2.html
 --   
 
-local options = {
+local config = {
     host="192.168.55.4",
     svdrp_port="6419",
     streamdev_port="3000",
+    -- time after which the '0' key returns to this channel
     previous_channel_time=10,
-    epg_update_time=300,
+    -- for how long to show playback/channel info
+    show_info_timeout=7,
+    -- timeout after which channel entry is assumed to be finished
+    channel_switch_timeout=5,
+
+    --media_dir="/Users/wache/Downloads/mps/", 
+    media_dir="/Volumes/video", 
+    -- all media extensions in upper case please!
+    media_extensions={".AVI",".MPG",".OGG",".M4A",".M3U",".MP4",".WEBM",},
+
+    -- if you don't want to use streamdev-streaming for recordings
+    -- you can provide the path to VDRs video directory here (mounted locally)
+    vdr_video_dir="",
+
+    -- recording MB/minute to estimate remaining recording time
+    mb_per_minute=25,
+
+    -- how often the current/next epg events are loaded from the server.
+    -- In seconds
+    epg_nownext_update_time=300,
+    -- time after which a schedule for a channel is considered out of date
+    -- and updated from the server. In seconds.
+    epg_channel_update_time=3600,
+    -- how long after the event ended it is still shown. In seconds.
+    epg_old_events_linger_time=120,
+
+    -- how much time before an event the timer starts. In minutes.
+    timer_margin_start=5,
+    -- how much time after an event the timer stops. In minutes.
+    timer_margin_stop=10,
+    -- the default lifetime of a recording (see VDRs manual)
+    timer_default_lifetime=99,
+    -- the default priority of a recording (see VDRs manual)
+    timer_default_priority=50,
+
+    osd_font_pixel_per_char=8,
+
+    osd_top_menu=20,
+    osd_left_menu=10,
+    osd_width_menu=450,
+    osd_height_menu=260,
+
+    osd_message_left=10,
+    osd_message_top=250,
+    osd_message_width=450,
+    osd_message_height=20,
+
+    osd_info_left=10,
+    osd_info_top=200,
+    osd_info_width=450,
+    osd_info_height=80,
 }
 require 'mp.options'
-read_options(options,'vdr-streamdev-client')
+read_options(config,'vdr-streamdev-client')
 local assdraw = require "mp.assdraw"
 
 local channels = { }
 local startup = 1
+local has_svdrp = 0
 local vdruri
 local utils = require 'mp.utils'
 local channel_idx=1
 local next_channel=0
 local last_channel=1
-local epgnow = {}
-local epgnext = {}
+local next_last_channel=1
+local update_last_channel_timeout
+local disk_space_available=nil
+local disk_space_free=nil
+local disk_space_percent=nil
+local epginfo = {}
+local epginfo_time = {}
 local epg_timer -- refreshes the epg info regulary
+local timerinfo = {}
 
 local vw=495
 local vh=275
 
+-- ************************* misc ***********************
+
+function ends_with(str,str_end)
+    local str_len=str:len()
+    return str:sub(1+str:len()-str_end:len(),str_len)==str_end
+end
+
+function strip_end(str,str_end)
+    local str_len=str:len()
+    return str:sub(1,str:len()-str_end:len()+1)
+end
+
+function toArray(i)
+    local array={}
+    for v in i do
+        array[#array+1]=v
+    end
+    return array
+end
+
+function slice(tbl,first,last)
+    local s={}
+    for i = first or 1, last or #tbl do
+        s[#s+1] = tbl[i]
+    end
+    return s
+end
 
 -- ************************* state machine stuff **********************
 local state={}
 local state_livetv
 local state_playback
 local state_channel_info
-local state_show_epg
+local main_menu_items
+
+function update_state()
+    local cstate=curr_state()
+    if (cstate.update_state) then
+        cstate:update_state()
+    end
+end
 
 function update_osd()
     local cstate=curr_state()
     mp.log("info","update_osd "..cstate.name)
+    local ass
     if (cstate.update_osd) then
-        cstate:update_osd()
+        ass = cstate:update_osd()
     else
-        clear_osd()
+        ass = assdraw.ass_new()
     end
+    if cstate.message ~= nil then
+        -- message box
+        ass:new_event()
+        ass:pos(config.osd_message_left, config.osd_message_top)
+        ass_color(ass,"007700")
+        ass_alpha(ass,"10")
+        ass:draw_start()
+        ass:rect_ccw(0,0,config.osd_message_width,config.osd_message_height)
+        ass:draw_stop()
+
+        -- print message
+        ass:new_event()
+        ass:pos(config.osd_message_left, config.osd_message_top)
+        ass:append(cstate.message)
+    end
+
+    mp.set_osd_ass(0, 0, ass.text)
 end
 
 function state_update_timeout()
@@ -95,7 +209,10 @@ function state_update_timeout()
     if cstate.update_osd_timeout then
         if cstate.osd_timer == nil then
             cstate.osd_timer=mp.add_periodic_timer(cstate.update_osd_timeout,
-            update_osd)
+                                  function()
+                                      update_state()
+                                      update_osd()
+                                  end)
         else
             cstate.osd_timer:kill()
             cstate.osd_timer:resume()
@@ -113,10 +230,27 @@ function state_remove_timeouts()
     end
 end
 
+function update_hide_osd_timeout()
+    local cstate=curr_state()
+    if cstate.hide_osd_timeout then
+        if cstate.hide_osd_timer ~= nil then
+            cstate.hide_osd_timer:kill()
+        end
+        cstate.hide_osd_timer=mp.add_timeout(cstate.hide_osd_timeout,
+             function()
+                 cstate.update_osd=nil
+                 update_osd()
+             end)
+    end
+    cstate.hide_osd_timeout=nil
+end
+
 function new_state(nstate)
     table.insert(state,nstate)
     mp.log("info","state_new "..nstate.name)
     state_update_timeout()
+    update_state()
+    update_hide_osd_timeout()
     update_osd()
 end
 
@@ -146,6 +280,7 @@ function state_back()
     end
     cstate=curr_state()
     mp.log("info","state_back, new "..cstate.name)
+    update_state()
     update_osd()
 end
 
@@ -174,6 +309,10 @@ function ass_clip(ass,x1,y1,x2,y2)
     ass:append("{\\clip("..x1..","..y1..","..x2..","..y2.."}")
 end
 
+local function vdrtime2str(t)
+    return t:sub(1,2)..":"..t:sub(3,5)
+end
+
 local function print_time(t)
     if (t == nil) then
         return "    "
@@ -181,17 +320,56 @@ local function print_time(t)
     return os.date('%H:%M',t)
 end
 
+local function print_date(t)
+    if (t == nil) then
+        return "    "
+    end
+    return os.date('%a %d.%m',t)
+end
+
+-- local fake time stamp
+local function lts(options)
+    if options.hour == nil then options.hour=0 end
+    if options.min == nil then options.min=0 end
+    return ((((options.year-1970)*366+options.month)*31+options.day)*24+
+            options.hour)*60+options.min
+end
+
+local function to_lts(date, time)
+    local year=tonumber(date:sub(1,4))
+    local month=tonumber(date:sub(6,7))
+    local day=tonumber(date:sub(9,10))
+    local min=tonumber(time:sub(3,4))
+    local hour=tonumber(time:sub(1,2))
+    --return os.time{year=year,month=month,day=day,hour=hour,minute=min}
+    return lts{year=year,month=month,day=day,
+                               hour=hour,min=min}
+end
+
 local function format_epg(epg_info)
     if epg_info == nil then return "" end
 
-    local msg=print_time(epg_info['start'])
+    local msg
+    msg=print_time(epg_info['start'])
+    if (epg_info.timer_status =="T") then
+        msg= msg.." REC: "
+    end
     if (epg_info['title'] ~= nil) then
         msg = msg.." "..epg_info['title']
     end
     return msg
 end
 
+local function date_format_epg(epg_info)
+    local msg=format_epg(epg_info)
+    msg = print_date(epg_info.start) .. " " .. msg
+    return msg
+end
+
 local function print_duration(t)
+    if t==nil then
+        return "xx:xx:xx"
+    end
     local h=math.floor(t/3600)
     local m=math.floor(t%3600/60)
     local s=t%60
@@ -201,6 +379,14 @@ end
 function curr_channel_id()
     local cinfo = channels[channel_idx]
     return cinfo and cinfo['id'] or nil
+end
+
+function channel_id_to_idx(cid)
+    for i,v in pairs(channels) do
+        if v.id == cid then
+            return i
+        end
+    end
 end
 
 function draw_progressbar(ass,left,top, width, height, part)
@@ -227,81 +413,84 @@ function draw_progressbar(ass,left,top, width, height, part)
 end
 
 function show_playback_info(self)
-    local osd_w=480
-    local osd_h=80
-    local top=200
-    local left=10
-    local time_pos = mp.get_property_native("time-pos")
+    --local time_pos = mp.get_property_native("time-pos")
+    local time_pos = mp.get_property_native("playback-time")
     local max_time = mp.get_property_native("duration")
     local ass = assdraw.ass_new()
 
     -- channel info box
     ass:new_event()
-    ass:pos(left, top)
+    ass:pos(config.osd_info_left, config.osd_info_top)
     ass_color(ass,"000000")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w,osd_h)
+    ass:rect_ccw(0,0,config.osd_info_width,config.osd_info_height)
     ass:draw_stop()
 
     -- print current playback time
     ass:new_event()
-    ass:pos(left, top)
+    ass:pos(config.osd_info_left, config.osd_info_top)
     ass:append(print_duration(time_pos))
 
     -- print playback length
     ass:new_event()
-    ass:pos(osd_w-80, top)
+    ass:pos(config.osd_info_width-80, config.osd_info_top)
     ass:append(print_duration(max_time))
 
     -- print recording name
     ass:new_event()
-    ass:pos(left+80, top)
+    ass:pos(config.osd_info_left+80, config.osd_info_top)
+    ass_clip(ass,config.osd_info_left+80,config.osd_info_top,
+                 config.osd_info_left+config.osd_info_width-100,config.osd_info_top+20)
+    ass_scale_font(ass,80)
     ass:append(self.rinfo['name'])
 
-    draw_progressbar(ass,left+10,top+30,osd_w-left-10,20,time_pos/max_time)
+    if time_pos~= nil and max_time~= nil then
+        draw_progressbar(ass,config.osd_info_left+10,config.osd_info_top+30,
+            config.osd_info_width-config.osd_info_left-10,20,time_pos/max_time)
+    end
 
-    mp.set_osd_ass(0, 0, ass.text)
+    return ass
 end
 
 function show_channel_info(self)
-    local osd_w=480
-    local osd_h=80
-    local top=200
-    local left=10
-    local cinfo=channels[channel_idx]
     local ass = assdraw.ass_new()
+    local cidx = next_channel==0 and channel_idx or next_channel
+    cinfo = channels[cidx]
 
     -- channel info box
-    ass:pos(left, top)
+    ass:pos(config.osd_info_left, config.osd_info_top)
     ass_color(ass,"000000")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w,osd_h)
+    ass:rect_ccw(0,0,config.osd_info_width,config.osd_info_height)
     ass:draw_stop()
 
     -- info time box
     ass:new_event()
-    ass:pos(left, top)
+    ass:pos(config.osd_info_left, config.osd_info_top)
     ass_color(ass,"000090")
     ass:draw_start()
-    ass:rect_ccw(0,0,50,23)
+    ass:rect_ccw(0,0,55,23)
     ass:draw_stop()
 
     -- print time
     ass:new_event()
-    ass:pos(left, top)
+    ass:pos(config.osd_info_left, config.osd_info_top)
     ass:append(os.date("%H:%M"))
 
     -- channel name
     ass:new_event()
-    ass:pos(left+70, top)
-    ass:append(channel_idx)
+    ass:pos(config.osd_info_left+70, config.osd_info_top)
+    ass:append(cidx)
+    if next_channel~=0 then
+        ass:append("_")
+    end
     if cinfo then ass:append("  "..cinfo['name']) end
     ass:new_event()
 
     local cid = cinfo and cinfo['id'] or nil
-    local einfo=epgnow[cid] 
+    local einfo=get_epgnow(cid)
     if einfo then
         -- epg progress bar
         local dwidth=200
@@ -309,108 +498,109 @@ function show_channel_info(self)
         if einfo['start'] ~= nil and einfo['duration'] ~= nil then
             local part = (os.time()-tonumber(einfo['start']))/
                           tonumber(einfo['duration'])
-            draw_progressbar(ass,left, top+24,dwidth,dheight,part)
+            draw_progressbar(ass,config.osd_info_left, config.osd_info_top+24,
+                             dwidth,dheight,part)
         end
 
         -- epg now info
-        ass:pos(left, top+35)
+        ass:pos(config.osd_info_left, config.osd_info_top+35)
         ass_scale_font(ass,80)
         ass:append(format_epg(einfo))
         ass:new_event()
     end
 
-    einfo = epgnext[cid]
+    einfo = get_epgnext(cid)
     if einfo ~= nil then
         -- epg next info
-        ass:pos(left, top+55)
+        ass:pos(config.osd_info_left, config.osd_info_top+55)
         ass_scale_font(ass,80)
         ass:append(format_epg(einfo))
         ass:new_event()
     end
 
-    mp.set_osd_ass(0, 0, ass.text)
+   return ass
 end
 
-local osd_w=480
-local osd_h=260
-local top=20
-local left=10
 function create_menu_base(options)
     local ass = assdraw.ass_new()
 
     -- menu  box
-    ass:pos(left, top)
+    ass:pos(config.osd_left_menu, config.osd_top_menu)
     ass_color(ass,"000000")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w,osd_h)
+    ass:rect_ccw(0,0,config.osd_width_menu,config.osd_height_menu)
     ass:draw_stop()
     ass:new_event()
 
     -- header box
-    ass:pos(left, top)
+    ass:pos(config.osd_left_menu, config.osd_top_menu)
     ass_color(ass,"000090")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w,20)
+    ass:rect_ccw(0,0,config.osd_width_menu,20)
     ass:draw_stop()
     ass:new_event()
 
     -- header
-    ass:pos(left, top)
+    ass:pos(config.osd_left_menu, config.osd_top_menu)
     ass:append(os.date("%H:%M"))
     if options and options.name then ass:append("  "..options.name) end
     ass:new_event()
 
     -- footer
-    ass:pos(left,top+osd_h-20)
+    ass:pos(config.osd_left_menu,config.osd_top_menu+config.osd_height_menu-20)
     ass_color(ass,"0000F0")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w/4,20)
+    ass:rect_ccw(0,0,config.osd_width_menu/4,20)
     ass:draw_stop()
     ass:new_event()
     if options and options.red then
-        ass:pos(left,top+osd_h-20)
+        ass:pos(config.osd_left_menu+2,config.osd_top_menu+config.osd_height_menu-20)
+        ass_scale_font(ass,80)
         ass:append(options.red)
         ass:new_event()
     end
 
-    ass:pos(left+osd_w/4,top+osd_h-20)
+    ass:pos(config.osd_left_menu+config.osd_width_menu/4,config.osd_top_menu+config.osd_height_menu-20)
     ass_color(ass,"00F000")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w/4,20)
+    ass:rect_ccw(0,0,config.osd_width_menu/4,20)
     ass:draw_stop()
     ass:new_event()
     if options and options.green then
-        ass:pos(left+osd_w/4,top+osd_h-20)
+        ass:pos(config.osd_left_menu+config.osd_width_menu/4+2,config.osd_top_menu+config.osd_height_menu-20)
+        ass_scale_font(ass,80)
         ass:append(options.green)
         ass:new_event()
     end
 
-    ass:pos(left+osd_w/4*2,top+osd_h-20)
+    ass:pos(config.osd_left_menu+config.osd_width_menu/4*2,config.osd_top_menu+config.osd_height_menu-20)
     ass_color(ass,"00F0F0")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w/4,20)
+    ass:rect_ccw(0,0,config.osd_width_menu/4,20)
     ass:draw_stop()
     ass:new_event()
     if options and options.yellow then
-        ass:pos(left,top+osd_h-20)
+        ass:pos(config.osd_left_menu+config.osd_width_menu/4*2+2,config.osd_top_menu+config.osd_height_menu-20)
+        ass_scale_font(ass,80)
         ass:append(options.yellow)
         ass:new_event()
     end
 
-    ass:pos(left+osd_w/4*3,top+osd_h-20)
+    ass:pos(config.osd_left_menu+config.osd_width_menu/4*3,config.osd_top_menu+config.osd_height_menu-20)
     ass_color(ass,"F00000")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,0,osd_w/4,20)
+    ass:rect_ccw(0,0,config.osd_width_menu/4,20)
     ass:draw_stop()
     ass:new_event()
     if options and options.blue then
-        ass:pos(left+osd_w/4*3,top+osd_h-20)
+        ass:pos(config.osd_left_menu+config.osd_width_menu/4*3+2,config.osd_top_menu+config.osd_height_menu-20)
+        ass_scale_font(ass,80)
         ass:append(options.blue)
         ass:new_event()
     end
@@ -418,24 +608,29 @@ function create_menu_base(options)
     return ass
 end
 
-function draw_scrollbar(ass,left,top,width,height,part)
+function draw_scrollbar(ass,left,top,width,height,pos,max)
+    local part=(pos-1)/(max-1)
     ass:pos(left,top)
     ass_color(ass,"000090")
     ass_alpha(ass,"70")
     ass:draw_start()
-    ass:rect_ccw(0,part*height,width,part*height+10)
+    ass:rect_ccw(0,part*(height-10),width,part*(height-10)+10)
     ass:draw_stop()
     ass:new_event()
 end
 
 local max_items=10
-local item_w=osd_w - 10
+local item_w=config.osd_width_menu - 10
 local item_h=20
 function show_menu(self)
-    local ass = create_menu_base{red=self.red_name,green=self.green_name,
+    local ass = create_menu_base{name=self.header,
+                                 red=self.red_name,green=self.green_name,
                                  yellow=self.yellow_name,blue=self.blue_name}
     if self.selected_item == nil then self.selected_item = 1 end
-    if self.start_pos == nil then self.start_pos = 1 end
+    if self.items == nil or #self.items == 0 then
+        return ass
+    end
+    if self.start_pos == nil or self.start_pos < 1  then self.start_pos = 1 end
     if self.selected_item>self.start_pos+max_items then
         self.start_pos=self.selected_item - max_items
     end
@@ -444,11 +639,13 @@ function show_menu(self)
     end
     local maxi = #self.items>self.start_pos+max_items 
                 and self.start_pos+max_items or #self.items
+    local draw_item=self.draw_item and self.draw_item or 
+                        draw_column_item(nil,self.column_width)
     for i = self.start_pos,maxi do
-        v = self.items[i]
-        local itop= top+(i-self.start_pos+1)*item_h
+        local v = self.items[i]
+        local itop= config.osd_top_menu+(i-self.start_pos+1)*item_h
         if self.selected_item == i then
-            ass:pos(left, itop)
+            ass:pos(config.osd_left_menu, itop)
             ass_color(ass,"000090")
             ass_alpha(ass,"70")
             ass:draw_start()
@@ -457,19 +654,19 @@ function show_menu(self)
             ass:new_event()
         end
         if v.draw == nil then
-            ass:pos(left, itop)
-            ass:append(v.text)
+            draw_item(v,ass,config.osd_left_menu,itop,item_w,item_h)
         else
-            v:draw(ass,left,itop,item_w,item_h)
+            v:draw(ass,config.osd_left_menu,itop,item_w,item_h)
         end
         ass:new_event()
     end
     if #self.items>max_items then
-        draw_scrollbar(ass,left+osd_w-10,top+20,10,osd_h-40,
-                       self.start_pos/#self.items)
+        draw_scrollbar(ass,config.osd_left_menu+config.osd_width_menu-10,
+                       config.osd_top_menu+20,10,config.osd_height_menu-40,
+                       self.start_pos,#self.items)
     end
 
-    mp.set_osd_ass(0, 0, ass.text)
+    return ass
 end
 
 function menu_handle_key(self,k)
@@ -502,11 +699,13 @@ function menu_handle_key(self,k)
         self.selected_item = k
     end
 
-    if self.selected_item > #self.items then 
-        self.selected_item = #self.items
-    end
-    if self.selected_item < 1 then 
-        self.selected_item = 1
+    if self.selected_item then
+        if self.items ~= nil and self.selected_item > #self.items then 
+            self.selected_item = #self.items
+        end
+        if self.selected_item < 1 then 
+            self.selected_item = 1
+        end
     end
     update_osd()
 end
@@ -516,54 +715,74 @@ function split_text(max_len,text)
     local pos = 1
     return function()
         local npos = text:find("\n",pos)
-        if npos == nil then npos=text:len() end
+        if npos == nil then npos=text:len()+1 end
 
         if npos-pos>max_len then
             -- find space to split the string
-            npos=text:find(" ",pos+max_len-margin>0 and pos+max_len-margin or 0)
-            if npos == nil then npos=text:len() end
+            npos=text:find("[ -.+]",pos+max_len-margin>0 and pos+max_len-margin or 0)
+            if npos == nil then npos=text:len()+1 end
         end
 
         if pos>=text:len() then
             return nil
         end
-        local ret = text:sub(pos,npos-1)
+        local ret = text:sub(pos,npos)
         pos = npos + 1
         return ret
     end
 end
 
-function show_epg(self)
-    local ass = create_menu_base{blue="Switch"}
+function show_text(self)
+    local ass = create_menu_base{name=self.header,
+                                 red=self.red_name,green=self.green_name,
+                                 yellow=self.yellow_name,blue=self.blue_name}
     local i = 0
-    local einfo = self:epg()
+    local t = config.osd_top_menu + 23
+    local l = config.osd_left_menu
+    local max_rows=16
+    local text = self.text and toArray(split_text(config.osd_width_menu/config.osd_font_pixel_per_char/0.8,self.text)) or {}
 
-    -- time, title
-    ass:pos(left, top+23)
-    ass:append(format_epg(einfo))
-    ass:new_event()
-    -- subtitle
-    if einfo and einfo['subtitle'] then
-        ass:pos(left, top+48)
-        ass_scale_font(ass,80)
-        ass:append(einfo['subtitle'])
+    if self.start_pos == nil then self.start_pos = 1 end
+    if self.start_pos < 1 then self.start_pos = 1 end
+    if self.start_pos > #text then self.start_pos = #text end
+    local sp=self.start_pos
+
+    if self.title then
+        -- time, title
+        ass:pos(l, t)
+        ass_clip(ass,l,t,l+config.osd_width_menu-10,t+25)
+        ass:append(tostring(self.title))
         ass:new_event()
+        t = t + 25
+        max_rows = max_rows - 2
     end
-    if einfo and einfo['description'] then
-        for v in  split_text(85,einfo['description']:gsub("|","\n")) do
-            i = i + 1
-            ass:pos(left, top+53+i*13)
-            ass_scale_font(ass,70)
-            ass:append(v)
-            ass:new_event()
+    -- subtitle
+    if self.subtitle then
+        ass:pos(l, t)
+        ass_scale_font(ass,80)
+        ass:append(tostring(self.subtitle))
+        ass:new_event()
+        t = t + 20
+        max_rows = max_rows - 2
+    end
+    if self.text then
+        for j=0,max_rows  do
+            local v = text[j+sp]
+            if v then
+                ass:pos(config.osd_left_menu, t + j*13)
+                ass_scale_font(ass,70)
+                ass:append(v)
+                ass:new_event()
+            end
         end
     end
+    if #text > max_rows then
+        draw_scrollbar(ass,config.osd_left_menu+config.osd_width_menu-10,
+                       config.osd_top_menu+20,10,config.osd_height_menu-40,
+                       self.start_pos,#text)
+    end
 
-    mp.set_osd_ass(0, 0, ass.text)
-end
-
-function clear_osd()
-    mp.set_osd_ass(0, 0, "")
+    return ass
 end
 
 function key(k)
@@ -577,29 +796,13 @@ function key(k)
     end
 end
 
-function toArray(i)
-    local array={}
-    for v in i do
-        array[#array+1]=v
-    end
-    return array
-end
-
-function slice(tbl,first,last)
-    local s={}
-    for i = first or 1, last or #tbl do
-        s[#s+1] = tbl[i]
-    end
-    return s
-end
-
 local function send_webrequest(path)
     ret = utils.subprocess({
         args= {'/bin/bash', '-c', '( printf "GET /'..path
-               ..' HTTP/1.0\n\n"; sleep 1)|nc '..options.host..' '
-               ..options.streamdev_port},
+               ..' HTTP/1.0\n\n"; sleep 1)|nc '..config.host..' '
+               ..config.streamdev_port},
 --        args= {'/bin/bash', '-c', 'echo "'..command
---               ..'" >/dev/tcp/'..options.host..'/'..options.svdrp_port},
+--               ..'" >/dev/tcp/'..config.host..'/'..config.svdrp_port},
         cancellable=false,
     })
     return ret.stdout
@@ -652,23 +855,63 @@ local function parse_ext3mu(stdout)
     return ret
 end
 
+local function collect_directories(recordings)
+    mp.log("info","collect recordings")
+    local ret={}
+    local cache_tree={
+        entries={},
+        child={},
+    }
+    for i,v in pairs(recordings) do
+        local dirs=toArray(string.gmatch(v['name'],"[^~]+"))
+        local j=1
+        local dir=ret
+        local cache=cache_tree
+        while (j~=#dirs) do
+            if cache.child[dirs[j]] == nil then
+                cache.child[dirs[j]] = {
+                   entries={},
+                   child={},
+               }
+               cache.entries[dirs[j]]={
+                    name=dirs[j],
+                    title=dirs[j],
+                }
+                table.insert(dir,cache.entries[dirs[j]])
+            end
+            dir=cache.entries[dirs[j]]
+            cache=cache.child[dirs[j]]
+            j = j + 1
+        end
+        v.title=dirs[#dirs]
+        table.insert(dir,v)
+    end
+    return ret
+end
+
 local function send_svdrp(command)
     ret = utils.subprocess({
-        args= {'/bin/bash', '-c', 'echo "'..command
-               ..'" |nc '..options.host..' '..options.svdrp_port},
+        args= {'/bin/bash', '-c', 'printf "'..command
+               ..'\n" |nc '..config.host..' '..config.svdrp_port},
 --        args= {'/bin/bash', '-c', 'echo "'..command
---               ..'" >/dev/tcp/'..options.host..'/'..options.svdrp_port},
+--               ..'" >/dev/tcp/'..config.host..'/'..config.svdrp_port},
         cancellable=false,
     })
+    if ret.error=="init" then
+        mp.log("warn","Could not contact VDR server. Do you have 'bash' and 'nc' (netcat) installed?")
+    end
+    if ret.status ~= 0 then
+        mp.log("warn","Could not contact VDR server. Is the SVDRP port "..config.svdrp_port.." correct, is it open and the client's IP in svdrphosts.conf?")
+    end
     return ret.stdout
 end
 
 local function parse_lstc(stdout)
     mp.log("info","Getting channel list")
     for i in string.gmatch(stdout,"[^\r\n]+") do
-        local code = i:sub(1,4)
-        if (code ~= "250-") then
-            mp.log("info","Unknown code '"..code.."'")
+        local code = i:sub(1,3)
+        if (code ~= "250") then
+            mp.log("info","Unknown code '"..i.."'")
         else
             local channel_end=i:find(";")
             if (channel_end ~=nil) then
@@ -696,76 +939,451 @@ end
 
 local function get_channels()
     parse_lstc(send_svdrp('LSTC'))
+    if #channels==0 then
+        mp.log("warn","Could not load channel list, only basic functionality will be available.")
+        
+    else
+        has_svdrp=1
+    end
+end
+
+local function parse_plug(stdout)
+    for i in string.gmatch(stdout,"[^\r\n]+") do
+        local code = i:sub(1,3)
+        if code == "214" then
+            local line = i:sub(5)
+            if line == "Available plugins:" then
+            elseif line == "End of plugin list" then
+            else
+                local plugin=line:sub(1,line:find(" ")-1)
+                mp.log("info","found plugin "..tostring(plugin))
+                if plugin == "svdrposd" then
+                    table.insert( main_menu_items,#main_menu_items+1,{
+                        text="Server OSD",
+                        action = function() 
+                            new_state( create_remote_osd_menu_state() )
+                        end,
+                    })
+                end
+            end
+        end
+    end
+end
+
+function check_for_plugins()
+    parse_plug(send_svdrp("PLUG"))
+end
+
+-- ************************* epg stuff  ***********************
+
+local function parse_event(event,line)
+    --mp.log("info","prase_event "..tostring(line))
+    if event==nil then event={} end
+    local code = line:sub(1,2)
+    local value = line:sub(3)
+    if code == "C " then
+        event.cid=value:sub(1,value:find(" ")-1)
+    elseif code == "E " then
+        local p=toArray(value:gmatch("[^ ]+"))
+        event['start'] = tonumber(p[2])
+        event['duration'] = tonumber(p[3])
+        event['stop'] = event.start + event.duration
+        event.start_date_str=print_date(event.start)
+        event.start_time_str=print_time(event.start)
+        event.start_lts=lts(os.date("*t",event.start))
+        event.stop_lts=lts(os.date("*t",event.stop))
+        event.cid=cid
+    elseif code == "T " then
+        event['title']=value
+    elseif code == "S " then
+        event['subtitle']=value
+    elseif code == "D " then
+        event['description']=value
+    else
+        --mp.log("info","Unknwon code "..tostring(code))
+    end
+    return event
 end
 
 local function parse_lste(stdout)
     local epginfo={}
     local cid 
+    local this_event = {}
+    local this_channel
     mp.log("info","Updating epg")
     for i in string.gmatch(stdout,"[^\r\n]+") do
-        local code = i:sub(1,5)
-        if (code == "215-C") then
-            cid=i:sub(7)
-            cid=cid:sub(1,cid:find(" ")-1)
-            -- mp.log("info","Channel '"..cid.."'")
-            if (epginfo[cid] == nil) then
-                epginfo[cid] = {}
+        local code = i:sub(1,3)
+        if code == "215" then
+            local c = i:sub(5,5)
+            local line = i:sub(5)
+            if c == "C" then
+                -- new channel
+                this_event=parse_event({},line)
+                this_channel = {}
+                cid = this_event.cid
+            elseif c =="e" then
+                -- end of event
+                this_event.cid = cid
+                table.insert(this_channel,this_event)
+                this_event = {}
+            elseif c =="c" then
+                -- end of channel
+                --mp.log("info","insert "..tostring(cid).." "..#this_channel)
+                epginfo[cid]=this_channel
+            else
+                this_event = parse_event(this_event,line)
             end
-        elseif (code == "215-T") then
-            --mp.log("info","cid '"..cid.."' Titel '"..i:sub(7).."'")
-            if (cid ~= nil) then
-                epginfo[cid]['title']=i:sub(7)
-            end 
-        elseif (code == "215-E") then
-            if (cid ~= nil) then
-                local p=toArray(i:sub(7):gmatch("[^ ]+"))
-                epginfo[cid]['start']=p[2]
-                epginfo[cid]['duration']=p[3]
-            end 
-        elseif (code == "215-S") then
-            if (cid ~= nil) then
-                epginfo[cid]['subtitle']=i:sub(7)
-            end 
-        elseif (code == "215-D") then
-            if (cid ~= nil) then
-                epginfo[cid]['description']=i:sub(7)
-            end 
-        elseif (code =="215-c") then
-            cid = nil
+        elseif code == "250" then
+            -- the reply to the stat command we send with update epg command
+            local line = i:sub(5)
+            mp.log("info",line)
+            disk_space_available,disk_space_free,disk_space_percent=line:match("(%d+)MB (%d+)MB (%d+)%%")
+            
         end
     end
     return epginfo
 end
 
-local function get_epg_now()
-    epgnow=parse_lste(send_svdrp("LSTE now"))
+local function merge_epg_channel(dst,src)
+    local di=1
+    local si=1
+    while dst[1] and dst[1].start+dst[1].duration
+             +config.epg_old_events_linger_time<os.time() do
+        --mp.log("info","removing old epg event "..tostring(dst[1].title))
+        table.remove(dst,1)
+    end
+    while si<=#src do
+        if dst[di]== nil or dst[di].start > src[si].start then
+            table.insert(dst,di,src[si])
+            di = di + 1
+            si = si + 1
+        elseif dst[di].start == src[si].start then
+            -- skip it it's already in
+            di = di + 1
+            si = si + 1
+        else
+            -- next destination item
+            di = di + 1
+        end
+    end
 end
 
-local function get_epg_next()
-    epgnext=parse_lste(send_svdrp("LSTE next"))
+local function merge_epg(dst,src)
+    for cid,epg in pairs(src) do
+        if dst[cid] ~= nil then
+            merge_epg_channel(dst[cid],epg)
+        else
+            dst[cid]=epg
+        end
+    end
+end
+
+function get_epgnow(cid)
+    if epginfo[cid] == nil or epginfo[cid][1] == nil then
+        return nil
+    end
+    local dst=epginfo[cid]
+    while dst[1] and dst[1].start+dst[1].duration
+             +config.epg_old_events_linger_time<os.time() do
+        --mp.log("info","removing old epg event "..tostring(dst[1].title))
+        table.remove(dst,1)
+    end
+    return dst[1]
+end
+
+function get_epgnext(cid)
+    return epginfo[cid] and (epginfo[cid][2] and epginfo[cid][2] or nil) or nil
+end
+
+local function load_epg_now()
+    merge_epg(epginfo,parse_lste(send_svdrp("LSTE now")))
+end
+
+local function load_epg_next()
+    merge_epg(epginfo,parse_lste(send_svdrp("LSTE next\n STAT disk")))
+end
+
+local function load_epg_channel(cid)
+    mp.log("info","load_epg_channel "..tostring(cid))
+    if epginfo_time[cid] == nil or
+           epginfo_time[cid]+config.epg_channel_update_time < os.time() then
+        merge_epg(epginfo, parse_lste(send_svdrp("LSTE "..cid)))
+        epginfo_time[cid]=os.time()
+    end
+    match_timer_to_event(timerinfo[cid],epginfo[cid])
+end
+
+-- ************************* timer stuff  ***********************
+
+local function parse_lstt(stdout)
+    local timerinfo={}
+    mp.log("info","Updating timers")
+    for i in string.gmatch(stdout,"[^\r\n]+") do
+        local code = i:sub(1,3)
+        if (code == "250") then
+            local timer={}
+            local setting_pos=i:find(" ",5)
+            timer.id=tonumber(i:sub(5,setting_pos-1))
+            local t=toArray(i:sub(setting_pos+1):gmatch("[^:]+"))
+            timer.enabled=tonumber(t[1])
+            if timer.enabled==1 then
+                timer.enabled_str=">"
+            elseif timer.enabled==9 then
+                timer.enabled_str="#"
+            else
+                timer.enabled_str=""
+            end
+            timer.cidx=tonumber(t[2])
+            timer.cid=channels[timer.cidx].id
+            timer.day=t[3]
+            timer.day_str=timer.day:sub(9,10).."."..timer.day:sub(6,7)
+            timer.start=t[4]
+            timer.start_str=vdrtime2str(timer.start)
+            timer.start_lts=to_lts(timer.day,timer.start)
+            timer.stop=t[5]
+            timer.stop_str=vdrtime2str(timer.stop)
+            timer.stop_lts=to_lts(timer.day,timer.stop)
+            if timer.stop_lts<timer.start_lts then 
+                timer.stop_lts=timer.stop_lts+24*60
+            end
+            timer.priority=t[6]
+            timer.lifetime=t[7]
+            timer.name=t[8]
+            timer.aux= t[9]~=nil and t[9] or ""
+            table.insert(timerinfo,timer)
+        end
+    end
+    return timerinfo
+end
+
+local function timer_from_event(event)
+    local timer={}
+    timer.id=nil
+    timer.enabled=1
+    timer.cidx=channel_id_to_idx(event.cid)
+    timer.day=os.date("%Y-%m-%d",event.start-config.timer_margin_start*60)
+    timer.start=os.date("%H%M",event.start-config.timer_margin_start*60)
+    timer.stop=os.date("%H%M",event.start+event.duration+config.timer_margin_stop*60)
+    timer.priority=config.timer_default_priority
+    timer.lifetime=config.timer_default_lifetime
+    if event.title ~= nil and string.len(event.title)>1 then
+        timer.name=event.title
+    else
+        timer.name=os.date("Rec %Y-%M-%d %H:%m",event.start)
+    end
+    timer.aux=""
+    return timer
+end
+
+local function toggle_timer_onoff(timer)
+    if timer.enabled==0 then
+        timer.enabled=1
+    else
+        timer.enabled=0
+    end
+end
+
+local function send_update_timer(timer)
+    local timer_str=""
+    timer_str = timer_str..timer.enabled..":"
+    timer_str = timer_str..timer.cidx..":"
+    timer_str = timer_str..timer.day..":"
+    timer_str = timer_str..timer.start..":"
+    timer_str = timer_str..timer.stop..":"
+    timer_str = timer_str..timer.priority..":"
+    timer_str = timer_str..timer.lifetime..":"
+    timer_str = timer_str..timer.name..":"
+    timer_str = timer_str..timer.aux
+    mp.log("info","send_update_timer: "..tostring(timer_str))
+    local result
+    if timer.id == nil then
+        result =send_svdrp("UPDT "..timer_str)
+    else
+        timer_str= tostring(timer.id).." "..timer_str
+        result =send_svdrp("MODT "..timer_str)
+    end
+    mp.log("info","send_update_timer: "..tostring(result))
+    if result:sub(1) == "5" then
+        return "Error: "..result
+    end
+end
+
+local function send_delete_timer(timer)
+    mp.log("info","send_delete_timer "..tostring(timer.id).." "..tostring(timer.name) )
+    local result=send_svdrp("DELT "..tostring(timer.id))
+    mp.log("info","send_delete_timer "..tostring(result))
+end
+
+function load_timers()
+    local timers=parse_lstt(send_svdrp("LSTT "))
+    timerinfo={}
+    for i,t in pairs(timers) do
+        if timerinfo[t.cid] == nil then
+            timerinfo[t.cid] = {}
+        end
+        table.insert(timerinfo[t.cid],t)
+    end
+    for i,t in pairs(timerinfo) do
+        table.sort(t,function(a,b) return a.start_lts<b.start_lts end )
+    end
+    table.sort(timers,function(a,b) return a.start_lts<b.start_lts end)
+    return timers
+end
+
+function match_timer_to_event(timers,events, max_events)
+    local ei=1
+    if events == nil then events={} end 
+    if max_events == nil then max_events=#events end
+    if max_events > #events then max_events=#events end
+    --mp.log("info","match_timer_to_event max_events "..max_events)
+    while ei<=max_events do
+        local ti=1
+        local event=events[ei]
+
+        event.timer_status=" "
+        event.timer=nil
+        --mp.log("info","event "..date_format_epg(event))
+        --mp.log("info","event "..event.start_lts.." "..event.stop_lts)
+        while timers and ti<=#timers and timers[ti].start_lts < event.stop_lts do
+                --mp.log("info","timer s tls "..timers[ti].start_lts.." stop: "..timers[ti].stop_lts.." "..timers[ti].day.." "..timers[ti].start.." "..timers[ti].stop..tostring(timers[ti].name))
+            if timers[ti].enabled == 0 then
+                -- ignore disabled timers
+            elseif timers[ti].stop_lts < event.start_lts then
+                -- do nothing, timer stops before this event starts
+                --mp.log("info","stops early "..timers[ti].stop_lts.." "..timers[ti].day.." "..timers[ti].start.." "..timers[ti].stop..tostring(timers[ti].name))
+            elseif timers[ti].start_lts < event.start_lts then
+                if timers[ti].stop_lts > event.stop_lts then
+                    event.timer_status="T"
+                    event.timer=timers[ti]
+                    timers[ti].event=event
+                    mp.log("info","found match "..tostring(event.title))
+                else
+                    -- partial recording, missing end
+                    if event.timer_status == " " then
+                        event.timer_status="t"
+                        mp.log("info","found p match missing end "..tostring(event.title))
+                        --mp.log("info","timer stop "..timers[ti].stop_lts.." "..timers[ti].day.." "..timers[ti].start.." "..timers[ti].stop..tostring(timers[ti].name))
+                        --mp.log("info","event "..date_format_epg(event))
+                        --mp.log("info","event "..event.start_lts.." "..event.stop_lts)
+                    end
+                end
+            else
+                if event.timer_status == " " then
+                    -- partial recording, missing start
+                    event.timer_status="t"
+                    mp.log("info","found p match missing start "..tostring(event.title))
+                    --mp.log("info","timer stop "..timers[ti].stop_lts.." "..timers[ti].day.." "..timers[ti].start.." "..timers[ti].stop..tostring(timers[ti].name))
+                    --mp.log("info","event "..date_format_epg(event))
+                    --mp.log("info","event "..event.start_lts.." "..event.stop_lts)
+                end
+            end
+            ti = ti + 1
+        end
+        ei = ei +1
+    end
+end
+
+local function match_nownext_timer_to_event()
+    local cid,events 
+    for cid,events in pairs(epginfo) do
+        match_timer_to_event(timerinfo[cid],events,3)
+    end
+end
+
+-- ************************* remote osd  ***********************
+
+local function parse_svdrposd_lsto(stdout)
+    local osdinfo={
+        open=false,
+        items={},
+    }
+    mp.log("info","Updating remote osd")
+    for i in string.gmatch(stdout,"[^\r\n]+") do
+        local code=i:sub(1,3)
+        if code == "920" then
+            osdinfo.open=true
+            local t=i:sub(5,5)
+            if t=="T" then
+                osdinfo.title=i:sub(7)
+            elseif t=="S" then
+                table.insert(osdinfo.items, {text=i:sub(7)})
+                osdinfo.selected=#osdinfo.items
+            elseif t=="I" then
+                table.insert(osdinfo.items, {text=i:sub(7)})
+            elseif t=="X" then
+                osdinfo.text=i:sub(7)
+            elseif t=="R" then
+                osdinfo.red=i:sub(7)
+            elseif t=="G" then
+                osdinfo.green=i:sub(7)
+            elseif t=="Y" then
+                osdinfo.yellow=i:sub(7)
+            elseif t=="B" then
+                osdinfo.blue=i:sub(7)
+            else
+                mp.log("info","unknown osd code "..tostring(i))
+            end
+        elseif code == "930" then
+            osdinfo.open=false
+        else
+            mp.log("info","unknown osd code "..tostring(i))
+        end
+    end
+    return osdinfo
 end
 
 local function switch_channel(no) 
     mp.log("info","switch_channel "..no)
     local sav_channel=channel_idx
-    mp.add_timeout(options.previous_channel_time,function()
-        last_channel=sav_channel
-    end)
+    if update_last_channel_timeout ~= nil then 
+        update_last_channel_timeout:kill() 
+    end
+    update_last_channel_timeout=mp.add_timeout(config.previous_channel_time,
+        function()
+            mp.log("info","Updating last channel to "..tostring(sav_channel))
+            mp.log("info","last_channel :"..tostring(last_channel).." next_lc "..tostring(next_last_channel))
+	    last_channel=next_last_channel
+	    next_last_channel=sav_channel
+            mp.log("info","last_channel :"..tostring(last_channel).." next_lc "..tostring(next_last_channel))
+       end)
     channel_idx=no
+    mp.set_property("demuxer-lavf-format","mpegts")
     mp.commandv("loadfile",vdruri .. channel_idx)
-    if curr_state().name ~="channel_info" then
-        new_state(state_channel_info)
-    else 
-        state_update_timeout()
+    mp.log("info","speed "..tostring(mp.get_property("speed")))
+    mp.set_property("speed",0.9)
+    if speed_timer~=nil then
+	    speed_timer:kill()
+    end
+    speed_timer=mp.add_timeout(20,function()
+	    mp.log("info","resetting speed "..tostring(mp.get_property("speed")))
+            mp.set_property("speed",1)
+	    mp.log("info","resetting speed "..tostring(mp.get_property("speed")))
+    end)
+
+    local state=curr_state()
+    if state.name =="livetv" then
+        state.update_osd = show_channel_info
+        state.hide_osd_timeout=config.show_info_timeout
+        update_hide_osd_timeout()
     end
     next_channel=0
     update_osd()
 end
 
 local function playback_recording(url) 
-    mp.log("info","play_rec "..url)
-    local sav_channel=channel_idx
-    mp.commandv("loadfile",url)
+    mp.log("info","play_rec "..tostring(url))
+    mp.commandv("playlist-clear")
+    --mp.commandv("playlist-remove","current")
+    if type(url)=="table" then
+        mp.log("info","loadfile "..tostring(url[1]))
+        mp.commandv("loadfile",url[1])
+        for i=2,#url do
+            mp.log("info","loadfile "..tostring(url[i]))
+            mp.commandv("loadfile",url[i],"append")
+        end
+    else
+        mp.commandv("loadfile",url)
+    end
 end
 
 local function channel_next()
@@ -785,7 +1403,8 @@ local function channel_prev()
     switch_channel(channel_idx);
 end
 
-local channel_timer=mp.add_periodic_timer(2,function() 
+local channel_timer=mp.add_periodic_timer(config.channel_switch_timeout,
+                                          function() 
     if ( next_channel ~= 0 ) then
         switch_channel(next_channel)
         next_channel = 0
@@ -795,47 +1414,31 @@ local channel_timer=mp.add_periodic_timer(2,function()
     end
 end)
 
-local function playback_handle_key(self,key)
-    mp.log("info","state name "..self.name)
-    if key=="BLUE" then
-        state_back_to("livetv")
-        switch_channel(channel_idx)
-    elseif key=="BS" then
-        state_back()
-        switch_channel(channel_idx)
-    elseif key=="DOWN" or key=="UP" then
-        mp.command("cycle pause")
-    elseif key=="YELLOW" then
-        mp.command("no-osd seek +30")
-        update_osd()
-    elseif key=="GREEN" then
-        mp.command("no-osd seek -30")
-        update_osd()
-    elseif key=="ENTER" then
-        if self.update_osd==nil then
-            self.update_osd=show_playback_info
-        else
-            self.update_osd=nil
-        end
-        update_osd()
-    end
-end
-
 local function livetv_handle_key(self,key)
     mp.log("info","state name "..self.name)
     if key=="ENTER" then
-        if self.name=="channel_info" then
-            state_back()
+        if next_channel ~= 0 then
+            switch_channel(next_channel)
+            next_channel = 0
+        elseif self.update_osd == nil then
+            self.update_osd = show_channel_info
+            self.hide_osd_timeout = config.show_info_timeout
+            update_hide_osd_timeout()
+            update_osd()
         else
-            new_state(state_channel_info)
+            self.update_osd = nil
+            update_osd()
         end
     elseif key=="BS" then
         if self.name=="channel_info" then
             state_back()
         end
     elseif key=="m" then
-        state_back()
-        new_state(state_main_menu)
+        if has_svdrp==1 then
+            -- no menu without svdrp connection
+            state_main_menu.selected_item=1
+            new_state(state_main_menu)
+        end
     elseif key=="UP" then
         channel_next()
     elseif key=="DOWN" then
@@ -843,71 +1446,63 @@ local function livetv_handle_key(self,key)
     elseif type(key) =="number" then
         if  key == 0 and next_channel == 0 then
             -- immediatly update last_channel
-            local sav_channel=channel_idx
+            mp.log("info","last_channel :"..tostring(last_channel).." next_lc "..tostring(next_last_channel))
             switch_channel(last_channel);
-            last_channel=sav_channel
+            local sav_channel=last_channel
+            last_channel=next_last_channel
+	    next_last_channel=sav_channel
+            mp.log("info","last_channel :"..tostring(last_channel).." next_lc "..tostring(next_last_channel))
             return
         end
         next_channel=next_channel*10+key
-        mp.osd_message(next_channel)
+        self.update_osd=show_channel_info
+        update_osd()
         channel_timer:resume()
     end
 end
 
 local function on_start()
     local url = mp.get_property("stream-open-filename")
-    mp.log("info","channels length "..#channels)
 
     if (url:find("vdrstream://") == 1) then
         if ( startup == 1) then
-            local host_port = url:sub(13)
-            if (host_port:len()>0) then
-                local has_port=host_port:find(":")
-                if (has_port) then
-                    options.host = host_port:sub(1,has_port-1)
-                    options.streamdev_port=host_port:sub(has_port+1)
-                else
-                    options.host = host_port
-                end
-            end
-            mp.log("info","VDR host:"..options.host)
-            mp.log("info","VDR svdrp port:"..options.svdrp_port)
-            mp.log("info","VDR streamdev port:"..options.streamdev_port)
-            vdruri="http://"..options.host..":"..options.streamdev_port.."/TS/"
-
-            -- set parameters to optimize channel switch time
-            mp.set_property("cache-secs",1)
-            mp.set_property("demuxer-lavf-analyzeduration",1)
-            mp.set_property("ytdl","no")
-
-            get_channels()
-            -- load epg in background
-            mp.add_timeout(1,function()
-                get_epg_now()
-                get_epg_next()
-                mp.log("info","finished epg")
-            end)
-            -- periodically update epg
-            epg_timer = mp.add_periodic_timer(options.epg_update_time,function() 
-                get_epg_now()
-                get_epg_next()
-            end)
-
+            do_startup(url)
             startup = 0
         end
         -- mp.set_property("stream-open-filename",channels[channel_idx])
         --mp.set_property("cache-size",1024)
-        switch_channel(1)
+        switch_channel(54)
+        --rinfo= {
+            --url="blah",
+            --name="Diese Datei",
+        --}
+        --new_state(create_playback_state(rinfo))
     end
     mp.log("info","Lua version " .. _VERSION)
 end
 
 function new_show_epgs_state(epg_info,channel_info)
-    state_show_epg = {
+    epg_info = epg_info and epg_info or {description="No data"}
+    channel_info = channel_info and channel_info or {}
+    local state_show_epg = {
         name = "menu_epg",
         handle_key = function(self,k)
             if k=="ENTER" or k=="BS" then
                 state_back()
+            elseif k=="DOWN" then
+                self.start_pos=self.start_pos+1
+                update_osd()
+            elseif k=="UP" then
+                self.start_pos=self.start_pos-1
+                update_osd()
+            elseif k=="RED" and self.red_action then
+                self:red_action()
+            elseif k=="GREEN" and self.green_action then
+                self:green_action()
+            elseif k=="YELLOW" and self.yellow_action then
+                self:yellow_action()
+            elseif k=="BLUE" and self.blue_action then
+                self:blue_action()
             elseif k=="m" then
                 state_remove_including("main_menu")
             elseif k=="BLUE" then
@@ -916,63 +1511,283 @@ function new_show_epgs_state(epg_info,channel_info)
             end
         end,
 
-        update_osd = show_epg,
-        epg = function(self)
-            return epg_info
-        end,
+        update_osd = show_text,
+        text = epg_info.description and epg_info.description:gsub('|','\n') or nil,
+        title = format_epg(epg_info),
+        subtitle = epg_info['subtitle'],
         cinfo = channel_info,
+        red_name = 'Record',
     }
+    state_show_epg.red_action = function()
+            action_record(state_show_epg,epg_info)
+        end
     return state_show_epg
 end
 
-function draw_epg_item(self,ass,left,top,width,height)
-    ass:pos(left,top)
-    ass_clip(ass,left,top,left+95,top+height)
-    ass_scale_font(ass,80)
-    ass:append(self.cinfo['name'])
-    ass:new_event()
+-- returns self[part1][part2]..[partn] for col_name 'part1.part2...partn'
+function get_col(self,col_name)
+    local p = col_name:find("%.")
+    if p then
+        return get_col(self[col_name:sub(1,p-1)],col_name:sub(p+1))
+    end
+    return self[col_name]
+end
 
-    ass:pos(left+100,top)
-    ass_scale_font(ass,80)
-    ass:append(print_time(self.einfo['start']))
-    ass:new_event()
+-- Returns a function to draw menu items
+--
+-- col_names should contain an array of names for get_col(), a function(self) returning
+-- the text to show in to column, or be nil.
+-- if col_names is nil self.text is split at tabulators (\t) and shown in columns
+--
+-- col_width should contain the width of the columns. If it is empty or missing values
+-- the remaining space is equally divided between the remaining columns
+function draw_column_item(col_names,col_width)
+    return function(self,ass,left,top,width,height)
+        local i
+        local l=left
+        local n=l
+        local cols=col_names
+        if cols == nil then
+            cols = toArray(self.text:gmatch("[^\t]+"))
+        end
 
-    if self.einfo['title'] then
-        ass:pos(left+150,top)
-        ass_clip(ass,left+150,top,left+width,top+height)
-        ass_scale_font(ass,80)
-        ass:append(self.einfo['title'])
-        ass:new_event()
+        for i=1,#cols do
+            local text
+            if col_names == nil then
+                text=cols[i]
+            elseif type(col_names[i]) == "function" then
+                text = col_names[i](self)
+            else
+                text=get_col(self,col_names[i])
+            end
+            if col_width and col_width[i] then
+                n=l+col_width[i]
+            else
+                n=l+(left+width-l)/(#cols-i+1)
+            end
+            if text ~= nil then
+                ass:pos(l,top)
+                ass_clip(ass,l,top,n-2,top+height)
+                ass_scale_font(ass,80)
+                ass:append(tostring(text))
+                ass:new_event()
+            end
+            l=n
+        end
     end
 end
 
-function create_epg_show_menu_state(name,epglist)
+function draw_tabbed_column_item(self,ass,left,top,width,height)
+    mp.log("info","draw_tabbed_column_item")
+    local cols = toArray(self.text:gmatch("[^\t]+"))
+    local pos = 0
+    local l = left
+    local n
+    local tabsize = 4
+    for i=1,#cols do
+        local text=cols[i]
+        if text ~= nil then
+            pos = (math.floor((pos + text:len())/tabsize)+1)*tabsize
+            n = left + math.floor(pos*config.osd_font_pixel_per_char*0.8)
+            ass:pos(l,top)
+            ass_clip(ass,l,top,
+                         (n>left+width and left+width or n)-2,top+height)
+            ass_scale_font(ass,80)
+            ass:append(tostring(text))
+            ass:new_event()
+        end
+        l=n
+    end
+end
+
+function action_record(nstate,event)
+    local timer=event.timer
+    local cid=event.cid
+    if timer ~= nil then
+        -- edit timer
+        new_state(create_edit_timer_menu_state(timer))
+    else
+        -- new timer
+        nstate.message="Creating timer..."
+        update_osd()
+        timer=timer_from_event(event)
+        local ret = send_update_timer(timer)
+        if ret ~= nil then
+            nstate.message=ret
+            update_osd()
+            mp.add_timeout(5,function()
+                nstate.message=nil
+                update_osd()
+            end)
+        else
+            nstate.message="Updating..."
+            update_osd()
+            mp.add_timeout(0.1,function()
+                load_timers()
+                match_timer_to_event(timerinfo[cid],epginfo[cid])
+                nstate.message=nil
+                update_osd()
+            end)
+        end
+    end
+end
+
+function create_epg_channel_schedule_menu_state(channel_idx)
+    local c=channels[channel_idx]
+    local cid=c.id
     local items={}
+    local nstate= new_menu_state("menu_schedule",items)
+    local draw_item = draw_column_item(
+         {'einfo.start_date_str','einfo.start_time_str','einfo.timer_status','einfo.title'},
+         {85,50,15})
+
+    local function update_items()
+        local schedule=epginfo[cid]
+        while #items>0 do
+            table.remove(items)
+        end
+        if schedule ~= nil then
+            for i,v in pairs(schedule) do
+                table.insert(items,{
+                    text=date_format_epg(v),
+                    action = function()
+                        new_state(new_show_epgs_state(v,c))
+                    end,
+                    draw = draw_item,
+                    einfo = v,
+                    cinfo = c,
+                })
+            end
+        end
+    end
+    update_items()
+
+    mp.add_timeout(0.1,function()
+        load_epg_channel(cid)
+        update_items()
+        nstate.message=nil
+        update_osd()
+    end)
+    nstate.header="Schedule "..c.name
+    nstate.message="Loading..."
+    nstate.red_name="Record"
+    nstate.red_action=function(self)
+        local event = self.items[self.selected_item].einfo
+        action_record(nstate, event)
+    end
+    nstate.green_name="Now"
+    nstate.green_action=function(self)
+        state_back()
+        new_state(create_epg_now_next_menu_state("epg_now", get_epgnow, channel_idx))
+    end
+    nstate.yellow_name="Next"
+    nstate.yellow_action=function(self)
+        state_back()
+        new_state(create_epg_now_next_menu_state("epg_next", get_epgnext, channel_idx))
+    end
+    nstate.blue_name="Switch"
+    nstate.blue_action=function(self)
+        state_back_to("livetv")
+        switch_channel(items[self.selected_item].cinfo.idx)
+    end
+    return nstate
+end
+
+function create_epg_now_next_menu_state(name,get_epg_fct, sel_cidx)
+    local items={}
+    local nstate= new_menu_state(name,items)
+    if sel_cidx == nil then sel_cidx = channel_idx end
+    local draw_item=draw_column_item(
+        {'cinfo.name',function(self) return print_time(self.einfo.start) end,'einfo.title'},
+        {100,55}
+        )
     for i=1,#channels do
         local c = channels[i]
         if c['id'] and c['name'] then
-            local e = epglist[c['id']]
+            local e = get_epg_fct(c['id'])
             if e then
                 table.insert(items,{
                     text=c['name']..format_epg(e),
                     action = function()
                         new_state(new_show_epgs_state(e,c))
                     end,
-                    draw = draw_epg_item,
+                    draw = draw_item,
                     einfo = e,
                     cinfo = c,
                 })
+                if sel_cidx == c.idx then
+                    nstate.selected_item=#items
+                end
             end
         end
     end
-    local nstate= new_menu_state(name,items)
     nstate.blue_name="Switch"
     nstate.blue_action=function(self)
         state_back_to("livetv")
-        switch_channel(self.selected_item)
+        switch_channel(items[self.selected_item].cinfo.idx)
     end
-    nstate.selected_item=channel_idx
+    nstate.yellow_name="Schedule"
+    nstate.yellow_action=function(self)
+        state_back()
+        new_state(create_epg_channel_schedule_menu_state(
+            items[self.selected_item].cinfo.idx))
+    end
+    if name=="epg_now" then
+        nstate.green_name="Next"
+        nstate.green_action=function(self)
+            state_back()
+            new_state(create_epg_now_next_menu_state("epg_next", get_epgnext,
+              items[self.selected_item].cinfo.idx))
+        end
+    else
+        nstate.green_name="Now"
+        nstate.green_action=function(self)
+            state_back()
+            new_state(create_epg_now_next_menu_state("epg_now", get_epgnow,
+              items[self.selected_item].cinfo.idx))
+        end
+    end
     return nstate
+end
+
+local function playback_handle_key(self,key)
+    mp.log("info","state name "..self.name)
+    local temporarily_show_info = function()
+        mp.log("info","temp_show_info "..tostring(self.hide_osd_timeout))
+        if self.hide_osd_timeout~=nil or self.update_osd==nil then
+            self.hide_osd_timeout = config.show_info_timeout
+            self.update_osd = show_playback_info
+            update_hide_osd_timeout()
+            update_osd()
+        end
+    end
+    if key=="BLUE" then
+        state_back_to("livetv")
+        switch_channel(channel_idx)
+    elseif key=="BS" then
+        state_back()
+        switch_channel(channel_idx)
+    elseif key=="DOWN" or key=="UP" then
+        mp.command("cycle pause")
+        temporarily_show_info()
+    elseif key=="YELLOW" then
+        mp.command("no-osd seek +30")
+        temporarily_show_info()
+    elseif key=="m" then
+        state_main_menu.selected_item=1
+        new_state(state_main_menu)
+    elseif key=="GREEN" then
+        mp.command("no-osd seek -30")
+        temporarily_show_info()
+    elseif key=="ENTER" then
+        if self.update_osd==nil then
+            self.update_osd=show_playback_info
+            self.hide_osd_timeout=nil
+        else
+            self.update_osd=nil
+        end
+        update_osd()
+    end
 end
 
 function create_playback_state(rinfo)
@@ -983,106 +1798,478 @@ function create_playback_state(rinfo)
        rinfo = rinfo,
        update_osd_timeout=1,
    }
+   state_playback.hide_osd_timeout = config.show_info_timeout
+   state_playback.update_osd = show_playback_info
    return state_playback
 end
 
-function create_recordings_show_items()
-    items={}
-    recordings=parse_ext3mu(send_webrequest("/recordings.m3u"))
-    for i,r in pairs(recordings) do
-        table.insert(items,{
-            text=r['name'],
-            action = function(self)
-                playback_recording(self.rinfo['url'])
-                new_state(create_playback_state(self.rinfo))
+function check_for_vdr_recording(dir,name)
+    local rinfos={}
+    local dirname=utils.join_path(dir,name)
+    local dirs = utils.readdir(dirname,"dirs")
+    if dirs == nil then dirs={} end
+    for i,v in pairs(dirs) do
+        if ends_with(v,".rec") then
+            local rdir=utils.join_path(dirname,v)
+            local files = utils.readdir(rdir,"files")
+            local rinfo={url={},name=name}
+            if files == nil then files={} end
+            for j,w in pairs(files) do
+                if ends_with(w,".ts") then
+                    table.insert(rinfo.url,utils.join_path(rdir,w))
+                elseif w:sub(1,1)=="0" and ends_with(w,".vdr") then
+                    -- old recoding
+                    table.insert(rinfo.url,utils.join_path(rdir,w))
+                elseif w=="info" or w=="info.vdr" then
+                    rinfo.info=utils.join_path(rdir,w)
+                end
+            end
+            if #rinfo.url>0 then
+                table.sort(rinfo.url)
+                table.insert(rinfos,rinfo)
+            end
+        end
+    end
+    return rinfos
+end
+
+function create_show_media_state(dirname)
+    local items={}
+    local dirs = utils.readdir(dirname,"dirs")
+    if dirs == nil then dirs={} end
+    for i,v in pairs(dirs) do
+        local vpath=utils.join_path(dirname,v)
+        local rinfos = check_for_vdr_recording(dirname,v)
+        if #rinfos>0 then
+            for j,w in pairs(rinfos) do
+                table.insert(items, {
+                    text=tostring(w.name),
+                    rinfo=w,
+                    action=function()
+                        playback_recording(w.url)
+                        new_state(create_playback_state(w))
+                    end
+                })
+            end
+        else
+            table.insert(items,{
+                text=tostring(v),
+                action=function()
+                    new_state( create_show_media_state(vpath))
+                end,
+            })
+        end
+    end
+    local files=utils.readdir(dirname,"files")
+    if files == nil then files={} end
+    for i,v in pairs(files) do
+        V=v:upper()
+        for j,w in pairs(config.media_extensions) do
+            if ends_with(V,w) then
+                local rinfo={
+                    name=tostring(v),
+                    url=utils.join_path(dirname,v),
+                    ext=w,
+                }
+                table.insert(items,{
+                    text=tostring(v),
+                    rinfo=rinfo,
+                    action=function()
+                        playback_recording(rinfo['url'])
+                        new_state(create_playback_state(rinfo))
+                    end,
+                })
+            end
+        end
+    end
+    local state=new_menu_state("Media",items)
+    state.blue_name="Info"
+    state.blue_action=function(self)
+        local item=self.items[self.selected_item]
+        local state={
+            name="Media Info",
+            update_osd=show_text,
+            text="No info",
+            handle_key=function()
+                state_back()
             end,
-            rinfo = r,
-        })
+        }
+        if item==nil or item.rinfo==nil then
+            -- error?
+        elseif item.rinfo.info then
+            local file = io.open(item.rinfo.info,"r")
+            if file then
+                local lines=file:read("*a")
+                local event={}
+                for v in lines:gmatch("[^\r\n]+") do
+                    event = parse_event(event,v)
+                end
+                state.text = event.description
+                state.title = format_epg(event)
+                state.subtitle = event.subtitle
+            else
+                mp.log("info","info file not found")
+            end
+        elseif item.rinfo.url then
+            local file =io.open(item.rinfo.url:sub(1,-1-item.rinfo.ext:len())..".txt","r")
+            if file then
+                state.text=file:read("*a")
+            else
+                mp.log("info","No filename.txt file found")
+            end
+        end
+        new_state(state)
+    end
+    return state
+end
+
+function create_recordings_show_items(recordings)
+    items={}
+    for i,r in pairs(recordings) do
+        if r['name'] ~= nil then
+            local text=r['title']
+            if r['time'] then text = r['time'].." "..text end
+            if r['day'] then text = r['day'].." "..text end
+            table.insert(items,{
+                text = text,
+                action = function(self)
+                    if #self.rinfo >0 then
+                        new_state( new_menu_state("Recordings",
+                           create_recordings_show_items(self.rinfo)
+                           ))
+                    else
+                        playback_recording(self.rinfo['url'])
+                        new_state(create_playback_state(self.rinfo))
+                    end
+                end,
+                rinfo = r,
+            })
+        end
     end
     return items
 end
 
+function create_timers_show_items(timers)
+    items={}
+    local draw_item=draw_column_item(
+       {'tinfo.enabled_str','tinfo.cidx','tinfo.day_str','tinfo.start_str','tinfo.stop_str','tinfo.name'},
+       {20,30,70,50,50})
+    for i,r in pairs(timers) do
+        table.insert(items,{
+            tinfo = r,
+            draw = draw_item,
+            action = function(self)
+                  new_state(create_edit_timer_menu_state(self.tinfo))
+                end,
+            })
+    end
+    return items
+end
+
+-- ************************* Remote OSD  ***********************
+
+local vdr_keys= {
+    UP="Up", DOWN="Down", LEFT="Left", RIGHT="Right",
+    BS="Back", RED="Red", GREEN="Green", YELLOW="Yellow", BLUE="Blue",
+    ENTER="Ok", m="MENU",
+}
+
+function update_remote_osd(self)
+    self.osdinfo=parse_svdrposd_lsto(send_svdrp("PLUG svdrposd LSTO"))
+    self.items=self.osdinfo.items
+    self.draw_item=draw_tabbed_column_item
+    if self.osdinfo.text then
+        self.text=self.osdinfo.text:gsub("|","\n")
+    else
+        self.text=""
+    end
+    self.selected_item=self.osdinfo.selected
+    self.red_name=self.osdinfo.red
+    self.green_name=self.osdinfo.green
+    self.yellow_name=self.osdinfo.yellow
+    self.blue_name=self.osdinfo.blue
+    self.header="Remote OSD: "..tostring(self.osdinfo.title)
+    mp.log("info","remote osd red: ".. tostring(self.red_name))
+
+    if self.items and #self.items>0 then
+        self.update_osd=show_menu
+    else
+        self.update_osd=show_text
+    end
+
+    self.message=nil
+    update_osd()
+end
+
+function remote_osd_handle_key(self,k)
+    mp.log("info","remote osd key "..k)
+    mp.log("info","osdinfo "..tostring(self.osdinfo.open))
+    if k=="BS" and self.osdinfo.open==false then
+        state_back()
+    elseif vdr_keys[k] ~= nil then
+        mp.log("info","sending key")
+        self.message="Updating..."
+        update_osd()
+        send_svdrp("HITK "..vdr_keys[k])
+        update_remote_osd(self)
+    end
+end
+
+function create_remote_osd_menu_state()
+    local state_menu = {
+        name = "remote_osd",
+        handle_key = remote_osd_handle_key,
+        update_osd = show_menu,
+        items = {},
+        osdinfo = {
+            open = false,
+        },
+        message = "Loading..",
+    }
+    mp.add_timeout(0.1,function()
+        update_remote_osd(state_menu)
+    end)
+    return state_menu
+end
+
+-- ************************* Menu Stuff  ***********************
 
 function new_menu_state(name,items)
     local state_menu = {
         name = name,
         handle_key = menu_handle_key,
         update_osd = show_menu,
-        items = items,
     }
+    if type(items) == "function" then
+        state_menu.message="Loading..."
+        mp.add_timeout(0.1, function()
+            state_menu.items=items()
+            state_menu.message=nil
+            update_osd()
+        end)
+    else
+        state_menu.items=items
+    end
     return state_menu
 end
 
-state_main_menu = new_menu_state("main_menu",
+function create_edit_timer_menu_state(timer)
+    local update_items=function()
+        local items={
+            { text="Active\t:  "..(timer.enabled==0 and "no" or "yes"), },
+            { text="Channel\t:  "..tostring(timer.cidx).." "..tostring(channels[timer.cidx].name),},
+            { text="Day\t:  "..timer.day},
+            { text="Start\t:  "..timer.start:sub(1,2)..":"..timer.start:sub(3,4),},
+            { text="Stop\t:  "..timer.stop:sub(1,2)..":"..timer.stop:sub(3,4),},
+            { text="Priority\t:  "..timer.priority,},
+            { text="Lifetime\t:  "..timer.lifetime,},
+            { text="File\t:   "..timer.name,},
+        }
+        return items
+    end
+
+    local timer_menu_state=new_menu_state("Show Timer", update_items)
+    timer_menu_state.column_width={80}
+    timer_menu_state.red_name="On/Off"
+    timer_menu_state.red_action=function(self)
+        timer_menu_state.message="Updating timer..."
+        update_osd()
+        toggle_timer_onoff(timer)
+        send_update_timer(timer)
+        load_timers()
+        match_timer_to_event(timerinfo[cid],epginfo[cid])
+        self.items=update_items()
+        timer_menu_state.message=nil
+        update_osd()
+    end
+    return timer_menu_state
+end
+
+function create_timer_menu_state()
+    local update_items= function()
+           local timers=load_timers();
+           return create_timers_show_items(timers)
+       end
+    local timer_menu_state=new_menu_state("Timers", update_items)
+
+    timer_menu_state.red_name="On/Off"
+    timer_menu_state.red_action=function(self)
+        timer_menu_state.message="Updating timer..."
+        update_osd()
+        local timer=self.items[self.selected_item].tinfo
+        toggle_timer_onoff(timer)
+        send_update_timer(timer)
+        self.items=update_items()
+        timer_menu_state.message=nil
+        update_osd()
+    end
+    timer_menu_state.yellow_name="Delete"
+    timer_menu_state.yellow_action=function(self)
+        timer_menu_state.message="Deleting timer..."
+        update_osd()
+        send_delete_timer(self.items[self.selected_item].tinfo)
+        self.items=update_items()
+        timer_menu_state.message=nil
+        update_osd()
+    end
+    timer_menu_state.blue_name="Info"
+    timer_menu_state.blue_action=function(self)
+        timer_menu_state.message="Loading..."
+        update_osd()
+        local timer=self.items[self.selected_item].tinfo
+        load_epg_channel(timer.cid)
+        mp.log("info","show info: "..tostring(timer.event).." "..tostring(channels[timer.cidx]))
+        local state=new_show_epgs_state(timer.event,
+                           channels[timer.cidx])
+        timer_menu_state.message=nil
+        new_state(state)
+    end
+    return timer_menu_state
+end
+
+function init_main_menu()
+    main_menu_items=
     {
         { 
-            text="What's on now",
+            text="Schedule",
             action = function() 
-                local nstate=create_epg_show_menu_state("epg_now",
-                               epgnow)
+                local nstate=create_epg_channel_schedule_menu_state(channel_idx)
                 new_state(nstate)
             end,
         },
         {
-            text="What's on next",
+            text="Timers",
             action = function() 
-                local nstate=create_epg_show_menu_state("epg_next",
-                               epgnext)
-                new_state(nstate)
+                new_state(create_timer_menu_state())
             end,
         },
-        {
+    }
+    if config.vdr_video_dir:len()==0 then
+        -- use streamdev for recordings
+        table.insert( main_menu_items, #main_menu_items+1, {
             text="Recordings",
             action = function() 
                 new_state( new_menu_state("Recordings",
-                   create_recordings_show_items()
-                   ))
+                function()
+                    local recordings=parse_ext3mu(send_webrequest("/recordings.m3u"))
+                    recordings = collect_directories(recordings)
+                    return create_recordings_show_items(recordings)
+                end
+                ))
             end,
-        },
-    })
+        })
+    else
+        -- vdr video dir is locally mounted, read it directly
+        table.insert( main_menu_items, #main_menu_items+1, {
+            text="Recordings",
+            action = function() 
+                new_state( create_show_media_state(config.vdr_video_dir) )
+            end
+        })
+    end
 
-state_epg_now = {
-    name = "state_epg_now",
-    handle_key = menu_handle_key,
-    update_osd = show_menu,
-}
+    if config.media_dir:len()>0 then
+        table.insert( main_menu_items,#main_menu_items+1,{
+            text="Media",
+            action = function() 
+                new_state( create_show_media_state(config.media_dir) )
+            end,
+        })
+    end
+    state_main_menu = new_menu_state("main_menu", main_menu_items)
+    state_main_menu.update_state = function(self)
+        if disk_space_available ~= nil then
+            local free_m=math.floor(disk_space_free/config.mb_per_minute)
+            self.header="Disk "..disk_space_percent.."% Free "..
+                        string.format("%02d:%02d",
+                               math.floor(free_m/60), free_m%60) .."h"
+        end
+    end
 
-state_livetv = {
-    name = "livetv",
-    handle_key = livetv_handle_key,
-    update_osd = nil,
-}
+    state_livetv = {
+        name = "livetv",
+        handle_key = livetv_handle_key,
+        update_osd = nil,
+    }
 
 
-state_channel_info = {
-    name = "channel_info",
-    handle_key = livetv_handle_key,
-    update_osd = show_channel_info,
-    timeout = 5,
-}
+    state_channel_info = {
+        name = "channel_info",
+        handle_key = livetv_handle_key,
+        update_osd = show_channel_info,
+        timeout = 5,
+    }
+end
 
-new_state( state_livetv )
+function do_startup(url)
+    init_main_menu()
 
-mp.add_key_binding("F1",'vdrkeyRED',key("RED"))
-mp.add_key_binding("F2",'vdrkeyGREEN',key("GREEN"))
-mp.add_key_binding("F3",'vdrkeyYELLOW',key("YELLOW"))
-mp.add_key_binding("F4",'vdrkeyBLUE',key("BLUE"))
-mp.add_key_binding("0",'vdrkey0',key(0))
-mp.add_key_binding("1",'vdrkey1',key(1))
-mp.add_key_binding("2",'vdrkey2',key(2))
-mp.add_key_binding("3",'vdrkey3',key(3))
-mp.add_key_binding("4",'vdrkey4',key(4))
-mp.add_key_binding("5",'vdrkey5',key(5))
-mp.add_key_binding("6",'vdrkey6',key(6))
-mp.add_key_binding("7",'vdrkey7',key(7))
-mp.add_key_binding("8",'vdrkey8',key(8))
-mp.add_key_binding("9",'vdrkey9',key(9))
-mp.add_key_binding("UP",'vdrkeyUP',key("UP"))
-mp.add_key_binding("DOWN",'vdrkeyDOWN',key("DOWN"))
-mp.add_key_binding("LEFT",'vdrkeyLEFT',key("LEFT"))
-mp.add_key_binding("RIGHT",'vdrkeyRIGHT',key("RIGHT"))
-mp.add_key_binding("ENTER",'vdrkeyENTER',key("ENTER"))
-mp.add_key_binding("BS",'vdrkeyBS',key("BS"))
-mp.add_key_binding("m",'vdrkeym',key("m"))
-mp.add_key_binding("i",'show_description',show_description)
+    mp.add_key_binding("F1",'vdrkeyRED',key("RED"))
+    mp.add_key_binding("F2",'vdrkeyGREEN',key("GREEN"))
+    mp.add_key_binding("F3",'vdrkeyYELLOW',key("YELLOW"))
+    mp.add_key_binding("F4",'vdrkeyBLUE',key("BLUE"))
+    mp.add_key_binding("0",'vdrkey0',key(0))
+    mp.add_key_binding("1",'vdrkey1',key(1))
+    mp.add_key_binding("2",'vdrkey2',key(2))
+    mp.add_key_binding("3",'vdrkey3',key(3))
+    mp.add_key_binding("4",'vdrkey4',key(4))
+    mp.add_key_binding("5",'vdrkey5',key(5))
+    mp.add_key_binding("6",'vdrkey6',key(6))
+    mp.add_key_binding("7",'vdrkey7',key(7))
+    mp.add_key_binding("8",'vdrkey8',key(8))
+    mp.add_key_binding("9",'vdrkey9',key(9))
+    mp.add_key_binding("UP",'vdrkeyUP',key("UP"),{repeatable=true})
+    mp.add_key_binding("DOWN",'vdrkeyDOWN',key("DOWN"),{repeatable=true})
+    mp.add_key_binding("LEFT",'vdrkeyLEFT',key("LEFT"),{repeatable=true})
+    mp.add_key_binding("RIGHT",'vdrkeyRIGHT',key("RIGHT"),{repeatable=true})
+    mp.add_key_binding("ENTER",'vdrkeyENTER',key("ENTER"))
+    mp.add_key_binding("BS",'vdrkeyBS',key("BS"))
+    mp.add_key_binding("m",'vdrkeym',key("m"))
+
+    local host_port = url:sub(13)
+    if (host_port:len()>0) then
+        local has_port=host_port:find(":")
+        if (has_port) then
+            config.host = host_port:sub(1,has_port-1)
+            config.streamdev_port=host_port:sub(has_port+1)
+        else
+            config.host = host_port
+        end
+    end
+    mp.log("info","VDR host:"..config.host)
+    mp.log("info","VDR svdrp port:"..config.svdrp_port)
+    mp.log("info","VDR streamdev port:"..config.streamdev_port)
+    vdruri="http://"..config.host..":"..config.streamdev_port.."/TS/"
+
+    -- set parameters to optimize channel switch time
+    --mp.set_property("cache-secs",1)
+    mp.set_property("demuxer-lavf-analyzeduration",1)
+    mp.set_property("ytdl","no")
+    mp.set_property("keep-open","yes")
+    mp.set_property("prefetch-playlist","yes")
+    mp.set_property("force-window","yes")
+    mp.log("info","demuxer "..tostring(mp.get_property("demuxer-lavf-format")))
+
+    get_channels()
+    -- load epg in background
+    mp.add_timeout(1,function()
+        load_timers()
+        load_epg_now()
+        load_epg_next()
+        match_nownext_timer_to_event()
+        mp.log("info","finished epg")
+        update_osd()
+        check_for_plugins()
+    end)
+    -- periodically update epg
+    epg_timer = mp.add_periodic_timer(config.epg_nownext_update_time,function() 
+        load_timers()
+        -- only update "next" event, old "next" events become "now" events
+        load_epg_next()
+        match_nownext_timer_to_event()
+    end)
+
+    new_state( state_livetv )
+end
+
 mp.add_hook("on_load", 50, on_start)

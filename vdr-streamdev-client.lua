@@ -427,6 +427,10 @@ function channel_id_to_idx(cid)
     return chid_to_idx[cid]
 end
 
+function channel_info_from_cid(cid)
+    return channels[chid_to_idx[cid]]
+end
+
 function draw_progressbar(ass,left,top, width, height, part)
     ass:new_event()
     ass:pos(left, top)
@@ -533,13 +537,13 @@ function show_channel_info(self)
     -- channel name
     ass:new_event()
     ass:pos(config.osd_info_left+70, config.osd_info_top)
-    if not cinfo.is_group_separator then
+    if cinfo and not cinfo.is_group_separator then
         ass:append(chno)
         if next_channel~=0 then
             ass:append("_")
         end
     end
-    if cinfo then ass:append("  "..cinfo['name']) end
+    if cinfo then ass:append("  "..tostring(cinfo['name'])) end
     ass:new_event()
 
     local cid = cinfo and cinfo['id'] or nil
@@ -766,7 +770,7 @@ function menu_handle_key(self,k)
         if  item and item.action then
             item:action()
         end
-    elseif k=="m" then
+    elseif k=="MENU" then
         state_remove_including("main_menu")
     elseif type(k) == "number" and  k>=0 and k<=9 then
         self.selected_item = k
@@ -1076,6 +1080,8 @@ local function parse_lstc(stdout)
                         local cid=para[4].."-"..para[11].."-"..para[12].."-"..para[10]
                         --mp.log("info",cid)
                         cinfo['id']=cid
+                    else 
+                        mp.log("info","para > 12: "..tostring(#para))
                     end
                     table.insert(channels,cinfo)
                     cinfo.idx=#channels
@@ -1302,7 +1308,7 @@ local function parse_lstt(stdout)
                 timer.enabled_str=""
             end
             timer.cid=t[2]
-            timer.cidx=channel_id_to_idx(timer.cid)
+            timer.chno=channel_info_from_cid(timer.cid).no
             timer.day=t[3]
             timer.day_str=timer.day:sub(9,10).."."..timer.day:sub(6,7)
             timer.start=t[4]
@@ -1328,7 +1334,8 @@ local function timer_from_event(event)
     local timer={}
     timer.id=nil
     timer.enabled=1
-    timer.cidx=channel_id_to_idx(event.cid)
+    timer.cid=event.cid
+    timer.chno=channel_info_from_cid(event.cid).no
     timer.day=os.date("%Y-%m-%d",event.start-config.timer_margin_start*60)
     timer.start=os.date("%H%M",event.start-config.timer_margin_start*60)
     timer.stop=os.date("%H%M",event.start+event.duration+config.timer_margin_stop*60)
@@ -1354,7 +1361,7 @@ end
 local function send_update_timer(timer)
     local timer_str=""
     timer_str = timer_str..timer.enabled..":"
-    timer_str = timer_str..timer.cidx..":"
+    timer_str = timer_str..timer.cid..":"
     timer_str = timer_str..timer.day..":"
     timer_str = timer_str..timer.start..":"
     timer_str = timer_str..timer.stop..":"
@@ -1523,7 +1530,7 @@ local function switch_channel(no)
     mp.set_property("demuxer-lavf-format","mpegts")
     mp.set_property("keep-open","yes")
     local cinfo = channels[channel_idx]
-    if cinfo then
+    if cinfo and cinfo.id then
         mp.commandv("loadfile",vdruri .. cinfo.id)
     else
         mp.commandv("loadfile",vdruri .. channel_idx)
@@ -1668,7 +1675,7 @@ local function livetv_handle_key(self,key)
             self.update_osd = nil
             update_osd()
         end
-    elseif key=="m" then
+    elseif key=="MENU" then
         if has_svdrp==1 then
             -- no menu without svdrp connection
             state_main_menu.selected_item=1
@@ -1746,7 +1753,7 @@ function new_show_epgs_state(epg_info,channel_info)
                 self:yellow_action()
             elseif k=="BLUE" and self.blue_action then
                 self:blue_action()
-            elseif k=="m" then
+            elseif k=="MENU" then
                 state_remove_including("main_menu")
             elseif k=="BLUE" then
                 state_back_to("livetv")
@@ -2014,7 +2021,7 @@ local function playback_handle_key(self,key)
     elseif key=="YELLOW" then
         mp.command("no-osd seek +30")
         temporarily_show_info()
-    elseif key=="m" then
+    elseif key=="MENU" then
         state_main_menu.selected_item=1
         new_state(state_main_menu)
     elseif key=="GREEN" then
@@ -2207,7 +2214,7 @@ end
 function create_timers_show_items(timers)
     items={}
     local draw_item=draw_column_item(
-       {'tinfo.enabled_str','tinfo.cidx','tinfo.day_str','tinfo.start_str','tinfo.stop_str','tinfo.name'},
+       {'tinfo.enabled_str','tinfo.chno','tinfo.day_str','tinfo.start_str','tinfo.stop_str','tinfo.name'},
        {20,30,70,50,50})
     for i,r in pairs(timers) do
         table.insert(items,{
@@ -2312,7 +2319,7 @@ function create_edit_timer_menu_state(timer)
     local update_items=function()
         local items={
             { text="Active\t:  "..(timer.enabled==0 and "no" or "yes"), },
-            { text="Channel\t:  "..tostring(timer.cidx).." "..tostring(channels[timer.cidx].name),},
+            { text="Channel\t:  "..tostring(timer.chno).." "..tostring(channel_info_from_cid(timer.cid).name),},
             { text="Day\t:  "..timer.day},
             { text="Start\t:  "..timer.start:sub(1,2)..":"..timer.start:sub(3,4),},
             { text="Stop\t:  "..timer.stop:sub(1,2)..":"..timer.stop:sub(3,4),},
@@ -2389,9 +2396,8 @@ function create_timer_menu_state()
         update_osd()
         local timer=self.items[self.selected_item].tinfo
         load_epg_channel(timer.cid)
-        mp.log("info","show info: "..tostring(timer.event).." "..tostring(channels[timer.cidx]))
         local state=new_show_epgs_state(timer.event,
-                           channels[timer.cidx])
+                           channel_info_from_cid(timer.cid))
         timer_menu_state.message=nil
         new_state(state)
     end
@@ -2525,8 +2531,8 @@ function do_startup(url)
     mp.add_key_binding("LEFT",'vdrkeyLEFT',key("LEFT"),{repeatable=true})
     mp.add_key_binding("RIGHT",'vdrkeyRIGHT',key("RIGHT"),{repeatable=true})
     mp.add_key_binding("ENTER",'vdrkeyENTER',key("ENTER"))
-    mp.add_key_binding("BS",'vdrkeyBS',key("BS"))
-    mp.add_key_binding("m",'vdrkeym',key("m"))
+    mp.add_key_binding("BS",'vdrkeyBACK',key("BS"))
+    mp.add_key_binding("m",'vdrkeyMENU',key("MENU"))
 
     local host,port,channel=url:match("vdrstream://([^:/]*)(:?[%d]*)(/?.*)")
     if host and host:len()>0 then

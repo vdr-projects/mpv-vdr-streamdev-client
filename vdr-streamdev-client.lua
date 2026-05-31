@@ -6,13 +6,13 @@
 --   https://www.gnu.org/licenses/gpl2.html
 --
 --   VDR Streamdev Client
---   Version 0.3.3.1
+--   Version 0.3.4
 --
 --   A script which turns mpv into a client for VDR with the Streamdev-Plugin
 --
 --   Features:
 --   * runs on Windows, Linux and Mac Os. (needs bash and netcat installed)
---   * easy channel switching a la vdr (no channel groups for now)
+--   * easy channel switching a la vdr (with channel group support)
 --   * show current and next epg event if available
 --   * create timers from epg, disable/enable and remove timers
 --   * watch recordings
@@ -141,8 +141,9 @@ local startup = 1
 local has_svdrp = 0
 local vdruri
 local utils = require 'mp.utils'
-local channel_idx=1
+local channel_idx=nil
 local next_channel=0
+local channel_timer
 local last_channel=1
 local next_last_channel=1
 local update_last_channel_timeout
@@ -532,9 +533,11 @@ function show_channel_info(self)
     -- channel name
     ass:new_event()
     ass:pos(config.osd_info_left+70, config.osd_info_top)
-    ass:append(chno)
-    if next_channel~=0 then
-        ass:append("_")
+    if not cinfo.is_group_separator then
+        ass:append(chno)
+        if next_channel~=0 then
+            ass:append("_")
+        end
     end
     if cinfo then ass:append("  "..cinfo['name']) end
     ass:new_event()
@@ -1042,11 +1045,23 @@ local function parse_lstc(stdout)
     mp.log("info","Getting channel list")
     for i in string.gmatch(stdout,"[^\r\n]+") do
         local code = i:sub(1,3)
+        local line = i:sub(5)
         if (code ~= "250") then
             mp.log("info","Unknown code '"..i.."'")
         else
             local channel_end=i:find(";")
-            if (channel_end ~=nil) then
+            if (channel_end ==nil) then
+                if i:sub(5,5)=="0" then
+                    -- channel separator
+                    local cinfo={}
+                    local start_cno,groupname=i:match("0 :@?(%d*) ?(.*)")
+                    cinfo.is_group_separator=true
+                    cinfo.name = groupname
+                    mp.log("info","found group "..utils.to_string(cinfo))
+                    table.insert(channels,cinfo)
+                end
+            else
+                -- normal channel
                 local channel=i:sub(5,channel_end-1)
                 local sp=channel:find(" ")
                 if (sp ~= nil) then
@@ -1077,7 +1092,7 @@ local function parse_lstc(stdout)
 end
 
 local function get_channels()
-    parse_lstc(send_svdrp('LSTC'))
+    parse_lstc(send_svdrp('LSTC :groups'))
     if #channels==0 then
         mp.log("warn","Could not load channel list, only basic functionality will be available.")
         
@@ -1286,8 +1301,8 @@ local function parse_lstt(stdout)
             else
                 timer.enabled_str=""
             end
-            timer.cidx=tonumber(t[2])
-            timer.cid=channels[timer.cidx].id
+            timer.cid=t[2]
+            timer.cidx=channel_id_to_idx(timer.cid)
             timer.day=t[3]
             timer.day_str=timer.day:sub(9,10).."."..timer.day:sub(6,7)
             timer.start=t[4]
@@ -1367,7 +1382,7 @@ local function send_delete_timer(timer)
 end
 
 function load_timers()
-    local timers=parse_lstt(send_svdrp("LSTT "))
+    local timers=parse_lstt(send_svdrp("LSTT id"))
     timerinfo={}
     for i,t in pairs(timers) do
         if timerinfo[t.cid] == nil then
@@ -1489,6 +1504,9 @@ local function switch_channel(no)
     if tonumber(no) == nil then
         no = channel_id_to_idx(no)
     end
+    while #channels > 0 and channels[no] and channels[no].is_group_separator do
+        no = no + 1
+    end
     local sav_channel=channel_idx
     if update_last_channel_timeout ~= nil then 
         update_last_channel_timeout:kill() 
@@ -1557,6 +1575,10 @@ end
 local function channel_next()
     mp.log("info","next channel called " .. channel_idx .. " len channels " .. #channels)
     channel_idx = channel_idx + 1
+    while #channels and channels[channel_idx].is_group_separator do
+        channel_idx = channel_idx + 1
+    end
+
     if #channels>0 and channel_idx > #channels then
         channel_idx = 1
     end
@@ -1565,46 +1587,86 @@ end
 local function channel_prev()
     mp.log("info","next channel called " .. channel_idx .. " len channels " .. #channels)
     channel_idx = channel_idx - 1
+    while #channels and channels[channel_idx] and channels[channel_idx].is_group_separator do
+        channel_idx = channel_idx - 1
+    end
     if (channel_idx < 1) then
         channel_idx =#channels > 0 and #channels or 1
     end
     switch_channel(channel_idx);
 end
 
-local channel_timer=mp.add_periodic_timer(config.channel_switch_timeout,
-                                          function() 
-    if ( next_channel ~= 0 ) then
-        local ncid=chno_to_idx[next_channel]
-        if ncid then
-            switch_channel(ncid)
-        else
-            switch_channel(next_channel)
-        end
-        next_channel = 0
+local function next_group()
+    mp.log("info","next group called")
+    local sav = channel_idx
+    channel_idx = channel_idx + 1
+    while #channels and channels[channel_idx] and not channels[channel_idx].is_group_separator do
+        channel_idx = channel_idx + 1
     end
+    if #channels and channel_idx>#channels then
+        channel_idx=sav
+    end
+end
+
+local function prev_group()
+    mp.log("info","next group called")
+    local sav = channel_idx
+    channel_idx = channel_idx - 1
+    while #channels and channels[channel_idx] and not channels[channel_idx].is_group_separator do
+        channel_idx = channel_idx - 1
+    end
+    if channel_idx < 1 then
+        channel_idx = sav
+    end
+end
+
+
+function update_channel_timer()
     if ( channel_timer ~= nil ) then
         channel_timer:kill()
     end
-end)
+    channel_timer=mp.add_timeout(config.channel_switch_timeout, function() 
+        if ( next_channel ~= 0 ) then
+            local ncid=chno_to_idx[next_channel]
+            if ncid then
+                switch_channel(ncid)
+            else
+                switch_channel(next_channel)
+            end
+            next_channel = 0
+        else
+            -- switch to current group
+            switch_channel(channel_idx)
+        end
+    end)
+end
 
 local function livetv_handle_key(self,key)
     mp.log("info","state name "..self.name)
-    if key=="ENTER" then
-        if next_channel ~= 0 then
-            switch_channel(next_channel)
-            next_channel = 0
-        elseif self.update_osd == nil then
+    local show_osd=function()
             self.update_osd = show_channel_info
             self.hide_osd_timeout = config.show_info_timeout
             update_hide_osd_timeout()
             update_osd()
+        end
+    if key=="ENTER" then
+        if next_channel ~= 0 then
+            local ncid=chno_to_idx[next_channel]
+            if ncid then
+                switch_channel(ncid)
+            else
+                switch_channel(next_channel)
+            end
+            next_channel = 0
+        elseif channels[channel_idx] and channels[channel_idx].is_group_separator then
+            -- confirm group switch
+            channel_timer:kill()
+            switch_channel(channel_idx)
+        elseif self.update_osd == nil then
+            show_osd()
         else
             self.update_osd = nil
             update_osd()
-        end
-    elseif key=="BS" then
-        if self.name=="channel_info" then
-            state_back()
         end
     elseif key=="m" then
         if has_svdrp==1 then
@@ -1616,6 +1678,14 @@ local function livetv_handle_key(self,key)
         channel_next()
     elseif key=="DOWN" then
         channel_prev()
+    elseif key=="RIGHT" then
+        next_group()
+        update_channel_timer()
+        show_osd()
+    elseif key=="LEFT" then
+        prev_group()
+        update_channel_timer()
+        show_osd()
     elseif type(key) =="number" then
         if  key == 0 and next_channel == 0 then
             -- immediatly update last_channel
@@ -1630,7 +1700,7 @@ local function livetv_handle_key(self,key)
         next_channel=next_channel*10+key
         self.update_osd=show_channel_info
         update_osd()
-        channel_timer:resume()
+        update_channel_timer()
     end
 end
 
@@ -1644,7 +1714,7 @@ local function on_start()
         end
         -- mp.set_property("stream-open-filename",channels[channel_idx])
         --mp.set_property("cache-size",1024)
-        switch_channel(config.startup_channel)
+        switch_channel(channel_idx)
         --rinfo= {
             --url="blah",
             --name="Diese Datei",
@@ -2416,6 +2486,23 @@ function init_main_menu()
     }
 end
 
+function channel_str_to_chidx(channel_str)
+    local chidx
+    if channel_str then
+        chidx=tonumber(channel_str)
+        mp.log("info","1 startup_channel "..tostring(chidx))
+        if #channels>0 and chidx then
+            -- translate channel number to channel idx
+            chidx=chno_to_idx[chidx]
+        end
+    end
+    if (chidx== nil and #channels>0 and channel_str and channel_str:len()>1) then
+        -- channel given as channel id
+        chidx=chid_to_idx[channel_str]
+    end
+    return chidx
+end
+
 function do_startup(url)
     init_main_menu()
 
@@ -2448,13 +2535,9 @@ function do_startup(url)
     if port and port:len()>1 then
         config.streamdev_port=tonumber(port:sub(2))
     end
-    if channel and channel:len()>1 then
-        config.startup_channel=tonumber(channel:sub(2))
-    end
     mp.log("info","VDR host:"..config.host)
     mp.log("info","VDR svdrp port:"..config.svdrp_port)
     mp.log("info","VDR streamdev port:"..config.streamdev_port)
-    mp.log("info","startup channel:"..config.startup_channel)
     vdruri="http://"..config.host..":"..config.streamdev_port.."/TS/"
 
     -- set parameters to optimize channel switch time
@@ -2465,9 +2548,16 @@ function do_startup(url)
     mp.set_property("idle","yes")
     mp.set_property("prefetch-playlist","yes")
     mp.set_property("force-window","yes")
-    mp.log("info","demuxer "..tostring(mp.get_property("demuxer-lavf-format")))
 
     get_channels()
+    channel=channel:sub(2)
+    channel_idx=channel_str_to_chidx(channel)
+    if channel_idx==nil then
+        channel_idx=channel_str_to_chidx(config.startup_channel)
+    end
+    if channel_idx==nil then
+        channel_idx=1
+    end
     -- load epg in background
     mp.add_timeout(1,function()
         load_timers()

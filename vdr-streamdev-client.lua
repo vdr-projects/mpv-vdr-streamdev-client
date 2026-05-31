@@ -1,6 +1,6 @@
 --
 --   VDR Streamdev Client
---   Version 0.3.0
+--   Version 0.2.0
 --
 --   A script which turns mpv into a client for VDR with the Streamdev-Plugin
 --
@@ -22,7 +22,7 @@
 --     command line option.
 --     For now --script vdr-streamdev-client.lua is prefered.
 --   5. start mpv
---     mpv  vdrstream://[vdr-host][:streamdev-port] [--script vdr-streamdev-client.lua]
+--     mpv  vdrstream://[vdr-host][:streamdev-port][/channel] [--script vdr-streamdev-client.lua]
 --
 --   When mpv is running in Streamdev client mode, you can use
 --   the keys UP,DOWN, 0-9 to select channels.
@@ -32,7 +32,8 @@
 --
 --   Many thanks to:
 --   - wolfi.m@vdr-portal.de for fixing the dimensions of the time-box
---     in the channel-info
+--     in the channel-info, the progress bar position and pointing
+--     out that I forgot to remove my startup channel.
 --
 --   Copyright 2017 Martin Wache
 --   VDR Streamdev Client is free software; you can redistribute it and/or
@@ -46,6 +47,8 @@ local config = {
     host="192.168.55.4",
     svdrp_port="6419",
     streamdev_port="3000",
+    -- default startup channel to show
+    startup_channel=1,
     -- time after which the '0' key returns to this channel
     previous_channel_time=10,
     -- for how long to show playback/channel info
@@ -498,12 +501,15 @@ function show_channel_info(self)
         if einfo['start'] ~= nil and einfo['duration'] ~= nil then
             local part = (os.time()-tonumber(einfo['start']))/
                           tonumber(einfo['duration'])
-            draw_progressbar(ass,config.osd_info_left, config.osd_info_top+24,
+            draw_progressbar(ass,config.osd_info_left+1, config.osd_info_top+24,
                              dwidth,dheight,part)
         end
 
         -- epg now info
         ass:pos(config.osd_info_left, config.osd_info_top+35)
+        ass_clip(ass,config.osd_info_left,config.osd_info_top+35,
+                     config.osd_info_left+config.osd_info_width,
+                     config.osd_info_top+55)
         ass_scale_font(ass,80)
         ass:append(format_epg(einfo))
         ass:new_event()
@@ -513,6 +519,9 @@ function show_channel_info(self)
     if einfo ~= nil then
         -- epg next info
         ass:pos(config.osd_info_left, config.osd_info_top+55)
+        ass_clip(ass,config.osd_info_left,config.osd_info_top+55,
+                     config.osd_info_left+config.osd_info_width,
+                     config.osd_info_top+config.osd_info_height)
         ass_scale_font(ass,80)
         ass:append(format_epg(einfo))
         ass:new_event()
@@ -1471,7 +1480,7 @@ local function on_start()
         end
         -- mp.set_property("stream-open-filename",channels[channel_idx])
         --mp.set_property("cache-size",1024)
-        switch_channel(54)
+        switch_channel(config.startup_channel)
         --rinfo= {
             --url="blah",
             --name="Diese Datei",
@@ -2226,19 +2235,20 @@ function do_startup(url)
     mp.add_key_binding("BS",'vdrkeyBS',key("BS"))
     mp.add_key_binding("m",'vdrkeym',key("m"))
 
-    local host_port = url:sub(13)
-    if (host_port:len()>0) then
-        local has_port=host_port:find(":")
-        if (has_port) then
-            config.host = host_port:sub(1,has_port-1)
-            config.streamdev_port=host_port:sub(has_port+1)
-        else
-            config.host = host_port
-        end
+    local host,port,channel=url:match("vdrstream://([^:/]*)(:?[%d]*)(/?.*)")
+    if host and host:len()>0 then
+        config.host=host
+    end
+    if port and port:len()>1 then
+        config.streamdev_port=tonumber(port:sub(2))
+    end
+    if channel and channel:len()>1 then
+        config.startup_channel=tonumber(channel:sub(2))
     end
     mp.log("info","VDR host:"..config.host)
     mp.log("info","VDR svdrp port:"..config.svdrp_port)
     mp.log("info","VDR streamdev port:"..config.streamdev_port)
+    mp.log("info","startup channel:"..config.startup_channel)
     vdruri="http://"..config.host..":"..config.streamdev_port.."/TS/"
 
     -- set parameters to optimize channel switch time
